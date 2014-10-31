@@ -1,0 +1,312 @@
+#!/usr/bin/env python
+
+from maxmindreader import *
+import sys, time, json, ConfigParser, socket, os, tempfile, urllib, shutil, zipfile, gzip
+from syslog import *
+from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
+from daemon import Daemon
+import argparse
+
+GEOIPD_PID_FILE = '/tmp/geoipd.pid'
+GEOIPD_DEFAULT_SERVER_IP = '127.0.0.1'
+GEOIPD_DEFAULT_SERVER_PORT = 12345
+GEOIPD_DEFAULT_DATA_DIR = '/var/geoipd/data'
+GEOIPD_CONFIG_FILE = '/etc/geoipd.cfg'
+
+''' TOOD: move to config ?!? '''
+MAX_MIND_SOURCES = [
+	{ 'url' : 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCity_CSV/GeoLiteCity-latest.zip', 'compressor' : 'zip' },
+	{ 'url' : 'http://geolite.maxmind.com/download/geoip/database/GeoIPCountryCSV.zip', 'compressor' : 'zip' },
+	{ 'url' : 'http://geolite.maxmind.com/download/geoip/database/GeoIPv6.csv.gz', 'compressor' : 'gz', 'filename' : 'GeoIPv6.csv' },
+	{ 'url' : 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCityv6-beta/GeoLiteCityv6.csv.gz', 'compressor' : 'gz', 'filename' : 'GeoLiteCityv6.csv'},
+	{ 'url' : 'http://download.maxmind.com/download/geoip/database/asnum/GeoIPASNum2.zip', 'compressor' : 'zip' },
+	{ 'url' : 'http://download.maxmind.com/download/geoip/database/asnum/GeoIPASNum2v6.zip', 'compressor' : 'zip' },
+]
+
+class ExtendedTCPServer(HTTPServer):
+	allow_reuse_address = True
+
+	def __init__(self, server_address, RequestHandlerClass, max_mind_reader):
+		HTTPServer.__init__(self, server_address, RequestHandlerClass)
+		self.max_mind_reader = max_mind_reader
+
+class ExtendedTCPServerHandler(BaseHTTPRequestHandler):
+
+	max_mind_reader = None
+
+	def do_GET(self):
+
+		request = self.path.split('?')
+
+		if request[0] != '/' or len(request) != 2:
+			self.send_response(400)
+			self.end_headers()
+		else:
+			print 'ip:' + str(request[1])
+			self.send_response(200)
+			self.send_header('Content-type', 'application/json')
+			self.end_headers()
+			self.wfile.write(json.dumps(self.server.max_mind_reader.get_ip_data(request[1].strip())))
+
+class GeoIPD(Daemon):
+
+	def __init__(self, pidfile, server_ip = None, server_port = None, data_dir = None):
+		
+		super(GeoIPD, self).__init__(pidfile=pidfile)
+
+		self.server_ip = server_ip
+		self.server_port = server_port
+		self.data_dir = data_dir
+		
+	def run(self):
+
+		try:
+			self.mmr = MaxMindReader(self.data_dir)
+		except (IOError, Exception), e:
+			syslog(LOG_ERR, 'failed to init MaxMindReader: %s' % (e))
+			sys.exit(1)
+		except:
+			syslog(LOG_ERR, 'failed to init MaxMindReader: unknown error')
+			sys.exit(1)
+
+		try:
+			self.httpd = ExtendedTCPServer((self.server_ip, self.server_port), ExtendedTCPServerHandler, self.mmr)
+		except:
+			syslog(LOG_ERR, 'failed to create server.')
+			sys.exit(1)
+
+		try:
+			syslog(LOG_ERR, 'geo ip daemon listens on %s@%d.\n' % (self.server_ip, self.server_port))
+			self.httpd.serve_forever()
+		except:
+			syslog(LOG_ERR, 'failed to start server:' % (sys.exc_info()[0]))
+			sys.exit(1)
+
+
+def network_port_chk(str_port):
+
+	try:
+		port = int(str_port)
+		assert(port > 0 and port < 65536)
+		return port
+	except:
+		syslog(LOG_ERR, 'config: server port invalid.')
+		raise TypeError('given value for port invalid. must be int between 0..65535')
+
+def ipv4_address_chk(str_addr):
+
+	try:
+		socket.inet_aton(str_addr)
+		return str_addr
+	except:
+		syslog(LOG_ERR, 'config: IPv4 address invalid.')
+		raise TypeError('given IPv4 address invalid.')
+
+def data_dir_chk(str_dir):
+
+	try:
+		assert(os.path.isdir(str_dir))
+		return str_dir
+	except:
+		syslog(LOG_ERR, 'config: data directory invalid.')
+		raise TypeError('data directory not accessible.')
+
+def param_chk(server_ip, server_port, data_dir):
+
+	try:
+		return ipv4_address_chk(server_ip), network_port_chk(server_port), data_dir_chk(data_dir)
+	except:
+		sys.exit(1)
+
+def daemon_start(server_ip, server_port, data_dir):
+
+	syslog(LOG_INFO, 'starting geo ip daemon...\n')
+
+	server_ip, server_port, data_dir = param_chk(server_ip, server_port, data_dir)
+
+	geoipd = GeoIPD(GEOIPD_PID_FILE, server_ip, server_port, data_dir)
+	geoipd.start()
+
+def daemon_stop(*_):
+	
+	syslog(LOG_INFO, 'stopping geo ip daemon...\n')
+
+	geoipd = GeoIPD(GEOIPD_PID_FILE)
+	geoipd.stop()
+
+	syslog(LOG_INFO, 'geo ip daemon stopped.\n')
+
+def daemon_restart(server_ip, server_port, data_dir):
+
+	syslog(LOG_INFO, 'restart geo ip daemon...\n')
+
+	server_ip, server_port, data_dir = param_chk(server_ip, server_port, data_dir)
+
+	geoipd = GeoIPD(GEOIPD_PID_FILE, server_ip, server_port, data_dir)
+	geoipd.restart()
+
+def download_databases(data_dir):
+
+	''' this is for convenience only. its error prone cause it lacks a lot of error checking.
+	    and please do not run it on each startup or you will create a lot of traffic @ mixmind.com 
+	    (and they may close the open service...) '''
+	
+	if not os.path.exists(data_dir):
+		try:
+			print 'missing data dir %s. create...' % data_dir
+			os.makedirs(data_dir)
+		except Exception as e:
+			sys.stderr.write('failed to create data directory: %s\n' % (e))
+			sys.exit(1)
+
+	try:
+		download_tmp_dir = tempfile.mkdtemp(prefix = 'geoipd_')
+		print 'created temporary download directory: %s' % download_tmp_dir
+	except Exception as e:
+		sys.stderr.write('failed to create temporary download directory: %s\n' % (e))
+		sys.exit(1)
+	
+	for source in MAX_MIND_SOURCES:
+
+		download_file_name = source['url'].split('/')[-1]
+		download_full_path = os.path.join(download_tmp_dir, download_file_name)
+
+		print 'downloading: %s' % download_file_name
+		urllib.urlretrieve(source['url'], download_full_path)
+
+		if source['compressor'] == 'zip':
+
+			if not zipfile.is_zipfile(download_full_path):
+				sys.stderr.write ( 'downloaded file `%s` is not a valid zip-file (maybe it 404ed). abort.\n' % download_file_name)
+				sys.exit(1)
+			try:
+				print 'extract: %s' % download_file_name
+				zfile = zipfile.ZipFile(download_full_path)
+				zfile.extractall(data_dir)
+
+				''' check for files in subfolders -> move to data_dir '''
+				for f in [f for f in zfile.namelist() if '/' in f]:
+					shutil.move(os.path.join(data_dir, f), os.path.join(data_dir, os.path.basename(f)))
+
+			except Exception as e:
+				sys.stderr.write('failed to extract `%s`: %s\n' % (download_file_name, e))
+				sys.exit(1)
+
+		elif source['compressor'] == 'gz':
+
+			gzip_file = None
+			target_full_path = os.path.join(data_dir, source['filename'])
+
+			try:
+				gzip_file = gzip.open(download_full_path, 'rb')
+			except Exception as e:
+				sys.stderr.write ( 'failed to open gzipped-file: %s\n' % str(e))
+				sys.exit(1)
+
+			try: 
+				out_file = open(target_full_path, 'w')
+			except Exception as e:
+				sys.stderr.write ( 'failed to open output file: %s\n' % str(e))
+				gzip_file.close()
+				sys.exit(1)
+
+			print 'extract: %s' % download_file_name
+			try:
+				out_file.write(gzip_file.read())
+			except Exception as e:
+				sys.stderr.write ( 'failed to uncompress data file: %s\n' % str(e))
+				gzip_file.close()
+				out_file.close()
+				sys.exit(1)
+
+			gzip_file.close()
+			out_file.close()
+
+		else:
+			sys.stderr.write('yes, you broke it (unknown compressor `%s` given).\n' % (source['compressor']));
+			sys.exit(1)
+
+	''' write a marker to show time / date of the last update '''
+	try:
+		marker = open(os.path.join(data_dir, 'last_update.txt'), 'w')
+		marker.write('%s (%d)\n' % (time.strftime("%a, %d %b %Y %H:%M:%S", time.localtime()), time.time()))		
+		marker.close()
+	except Exception as e:
+		sys.stderr.write ( 'failed to write timestamp into data dir: %s\n' % str(e))
+		if marker:
+			marker.close()
+		sys.exit(1)
+
+	shutil.rmtree(download_tmp_dir)
+
+if __name__ == "__main__":
+
+	data_dir = GEOIPD_DEFAULT_DATA_DIR
+	server_ip = GEOIPD_DEFAULT_SERVER_IP
+	server_port = GEOIPD_DEFAULT_SERVER_PORT
+
+	'''use configuration file GEOIPD_CONFIG_FILE if present'''
+	try:
+		config = ConfigParser.RawConfigParser()
+		config.read(GEOIPD_CONFIG_FILE)
+
+		try:
+			data_dir = config.get('GEOIPD', 'data-dir')
+		except ConfigParser.NoOptionError:
+			pass
+
+		try:
+			server_ip = config.get('GEOIPD', 'server-ip')
+		except ConfigParser.NoOptionError:
+			pass
+
+		try:
+			server_port = config.get('GEOIPD', 'server-port')
+		except ConfigParser.NoOptionError:
+			pass
+
+		except ConfigParser.MissingSectionHeaderError, e:
+			raise sys.stderr.write('missing GEOIPD section in %s' % (GEOIPD_CONFIG_FILE))
+	except:
+		pass
+
+	'''add/override config with command line args'''
+	parser = argparse.ArgumentParser()
+	subparsers = parser.add_subparsers(title='subcommands', description='commands for daemon control')
+	sp_start = subparsers.add_parser('start', help='start geoip daemon, see `%s start --help`' %(sys.argv[0]))
+	sp_start.add_argument('--port', help = 'local port to listen on', type = network_port_chk)
+	sp_start.add_argument('--ip', help = 'local IPv4 to listen on', type = ipv4_address_chk)
+	sp_start.add_argument('--data-dir', help = 'where to find/place the local data sources', type = data_dir_chk)
+	sp_start.add_argument('--force-download',  action='store_true', help = 'download database files from www.maxmind.com and update local data sources, needs write permission on data-dir.\nNote 1: this command may take a long time.\nNote 2: Avoid useless downloads.')
+	sp_start.set_defaults(func = daemon_start)
+	sp_restart = subparsers.add_parser('restart', help='restart geoip daemon, see `%s restart --help`' %(sys.argv[0]))
+	sp_restart.set_defaults(func = daemon_restart)
+	sp_restart.add_argument('--port', help = 'local port to listen on', type = network_port_chk)
+	sp_restart.add_argument('--ip', help = 'local IPv4 to listen on', type = ipv4_address_chk)
+	sp_restart.add_argument('--data-dir', help = 'where to find/place the local data sources', type =  data_dir_chk)
+	sp_stop = subparsers.add_parser('stop', help='stop geoip daemon')
+	sp_stop.set_defaults(func = daemon_stop)
+
+	if len(sys.argv) == 1:
+		sys.stderr.write("\n%s: missing arguments.\n\n" % (sys.argv[0]))
+		parser.print_help()
+		sys.exit(1)
+
+	args = parser.parse_args()
+
+	if 'data_dir' in args and args.data_dir is not None:
+		data_dir = args.data_dir
+	data_dir = os.path.abspath(data_dir) + os.sep
+
+	if 'ip' in args and args.ip is not None:
+		server_ip = args.ip
+
+	if 'port' in args and args.port is not None:
+		server_port = args.port
+
+	if 'force_download' in args and args.force_download:
+		syslog(LOG_INFO, 'update local database...')
+		download_databases(data_dir)
+		syslog(LOG_INFO, 'data source updated.')
+
+	args.func(server_ip, server_port, data_dir)
